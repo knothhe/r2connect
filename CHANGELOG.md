@@ -3,7 +3,7 @@
 All notable changes to this module are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## v0.1.1 - 2026-10-26
 
 ### Added
 
@@ -33,3 +33,9 @@ All notable changes to this module are recorded here. Versions follow
 ### Fixed
 
 - The macOS keyring backend rejects an empty value instead of panicking.
+
+## v0.1.0 - 2026-10-26
+
+- Initial release: the Cloudflare control-plane `Client` and the `Manager`
+  credential lifecycle, the `loopback` authorization-code flow and the
+  `keyring` SecretStore for macOS, Windows and Linux.
