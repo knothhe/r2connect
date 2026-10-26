@@ -36,16 +36,25 @@ type controlFixture struct {
 	expiresIn     int64
 	revokedTokens []string
 	accounts      []string
+	// refreshFails makes refresh grants fail as for a grant revoked in the
+	// dashboard.
+	refreshFails bool
 }
 
 func (f *controlFixture) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch {
 	case req.Method == "POST" && req.URL.Path == "/oauth2/token":
+		_ = req.ParseForm()
 		f.mu.Lock()
 		f.exchanges++
-		omitRefresh, expiresIn := f.omitRefresh, f.expiresIn
+		omitRefresh, expiresIn, refreshFails := f.omitRefresh, f.expiresIn, f.refreshFails
 		f.mu.Unlock()
+		if refreshFails && req.Form.Get("grant_type") == "refresh_token" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":"invalid_grant"}`)
+			return
+		}
 		if expiresIn == 0 {
 			expiresIn = 3600
 		}
@@ -332,8 +341,8 @@ func TestManagerPreservesUnreadableState(t *testing.T) {
 			t.Fatal(err)
 		}
 		m := NewManager(NewClient("synthetic-client"), ManagerOptions{Secrets: &memorySecrets{items: map[string][]byte{}}, State: FileStateStore{Path: path}})
-		if m.LoadError() == nil {
-			t.Fatalf("invalid state %q was accepted", data)
+		if !errors.Is(m.LoadError(), ErrInvalidState) {
+			t.Fatalf("invalid state %q was not reported as ErrInvalidState: %v", data, m.LoadError())
 		}
 		if err := m.Disconnect(t.Context()); err == nil {
 			t.Fatal("an operation ran on unreadable state")
@@ -638,7 +647,7 @@ func TestManagerRefreshableGrantRenewsCredentialsEarly(t *testing.T) {
 			t.Fatal("a failed early renewal interrupted use of valid credentials:", err)
 		}
 	}
-	if f.m.renewRetryAt.IsZero() {
+	if f.m.renewRetryAt[connection.ID].IsZero() {
 		t.Fatal("a failed early renewal did not back off")
 	}
 	f.setCredentialExpiry(t, time.Now().Add(time.Minute))
@@ -658,5 +667,150 @@ func TestManagerCodeOnlyGrantRenewsOnlyNearExpiry(t *testing.T) {
 	}
 	if _, mints, _, _ := f.control.counts(); mints != 1 {
 		t.Fatal("a code-only grant renewed credentials early")
+	}
+}
+
+func TestManagerRejectsInvalidOptions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	saved := `{"version":1,"connections":[]}`
+	if err := os.WriteFile(path, []byte(saved), 0600); err != nil {
+		t.Fatal(err)
+	}
+	secrets := &memorySecrets{items: map[string][]byte{}}
+	valid := func() ManagerOptions { return ManagerOptions{Secrets: secrets, State: FileStateStore{Path: path}} }
+	cases := map[string]func(*ManagerOptions){
+		"missing secrets":        func(o *ManagerOptions) { o.Secrets = nil },
+		"missing state":          func(o *ManagerOptions) { o.State = nil },
+		"negative duration":      func(o *ManagerOptions) { o.RenewalRetryDelay = -time.Second },
+		"negative connections":   func(o *ManagerOptions) { o.MaxConnections = -1 },
+		"lifetime inside window": func(o *ManagerOptions) { o.CredentialLifetime = 24 * time.Hour },
+		"lifetime equals window": func(o *ManagerOptions) { o.CredentialLifetime, o.RenewalWindow = time.Hour, time.Hour },
+		"lifetime inside margin": func(o *ManagerOptions) {
+			o.CredentialLifetime, o.RenewalWindow, o.ExpiryMargin = 5*time.Minute, time.Minute, 5*time.Minute
+		},
+		"token name prefix too long": func(o *ManagerOptions) { o.TokenNamePrefix = strings.Repeat("p", maxTokenNamePrefix+1) },
+	}
+	for name, change := range cases {
+		t.Run(name, func(t *testing.T) {
+			opts := valid()
+			change(&opts)
+			m := NewManager(NewClient("synthetic-client"), opts)
+			if !errors.Is(m.LoadError(), ErrInvalidOptions) {
+				t.Fatalf("invalid options were accepted: %v", m.LoadError())
+			}
+			if err := m.Authorize(t.Context(), TokenSet{AccessToken: "a", ExpiresAt: time.Now().Add(time.Hour), Scope: OAuthScopes}); !errors.Is(err, ErrInvalidOptions) {
+				t.Fatalf("an operation ran with invalid options: %v", err)
+			}
+			if _, err := m.Forget(); !errors.Is(err, ErrInvalidOptions) {
+				t.Fatalf("Forget ran with invalid options: %v", err)
+			}
+			if after, _ := os.ReadFile(path); string(after) != saved || secrets.len() != 0 {
+				t.Fatal("a Manager with invalid options wrote state or secrets")
+			}
+		})
+	}
+	opts := valid()
+	opts.CredentialLifetime, opts.RenewalWindow, opts.ExpiryMargin = time.Hour, 30*time.Minute, time.Minute
+	opts.TokenNamePrefix = strings.Repeat("p", maxTokenNamePrefix)
+	if err := NewManager(NewClient("synthetic-client"), opts).LoadError(); err != nil {
+		t.Fatal("consistent custom options were rejected:", err)
+	}
+}
+
+func TestManagerForgetClearsWhenDisconnectCannotFinish(t *testing.T) {
+	f := newManagerFixture(t)
+	f.authorize(t)
+	original := f.connect(t)
+	// A rotation whose old-token deletion fails leaves pending cleanup too.
+	f.setCredentialExpiry(t, time.Now().Add(time.Minute))
+	f.control.set(func(c *controlFixture) { c.deleteStatus = http.StatusServiceUnavailable })
+	if _, err := f.m.Credentials(t.Context(), original); err != nil {
+		t.Fatal(err)
+	}
+	current := f.m.State().Connections[0]
+	// The grant is then revoked in the dashboard, so nothing remote can run.
+	f.control.set(func(c *controlFixture) { c.deleteStatus, c.refreshFails = 0, true })
+	f.expireOAuth(t)
+	if err := f.m.Disconnect(t.Context()); err == nil || !f.m.Status().Authorized {
+		t.Fatal("Disconnect finished without a usable grant")
+	}
+	_, mints, deletes, revokes := f.control.counts()
+
+	failure := errors.New("synthetic secret deletion failure")
+	f.secrets.delFail = func(string) error { return failure }
+	if _, err := f.m.Forget(); !errors.Is(err, failure) || len(f.m.State().Connections) != 1 {
+		t.Fatal("a failed Forget cleared State before removing secrets:", err)
+	}
+	f.secrets.delFail = nil
+	orphans, err := f.m.Forget()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []RetiredToken{{AccountID: testAccount, TokenID: current.TokenID}, {AccountID: testAccount, TokenID: original.TokenID}}
+	if fmt.Sprint(orphans) != fmt.Sprint(want) {
+		t.Fatalf("Forget reported %v, want %v", orphans, want)
+	}
+	if _, m2, d2, r2 := f.control.counts(); m2 != mints || d2 != deletes || r2 != revokes {
+		t.Fatal("Forget contacted Cloudflare")
+	}
+	state := f.m.State()
+	if f.secrets.len() != 0 || state.Authorized || state.ClientID != "" || len(state.Connections) != 0 || len(state.RetiredTokens) != 0 || f.m.Status().Authorized {
+		t.Fatalf("Forget left local data behind: secrets=%d state=%+v", f.secrets.len(), state)
+	}
+	reopened := NewManager(f.client, ManagerOptions{Secrets: f.secrets, State: f.state.FileStateStore})
+	if err = reopened.LoadError(); err != nil || len(reopened.State().Connections) != 0 {
+		t.Fatal("Forget did not persist the cleared State:", err)
+	}
+	// A grant for different accounts is accepted again.
+	f.control.set(func(c *controlFixture) { c.accounts, c.refreshFails = []string{strings.Repeat("2", 32)}, false })
+	f.authorize(t)
+}
+
+func TestManagerDisconnectWithChangedClient(t *testing.T) {
+	f := newManagerFixture(t)
+	f.authorize(t)
+	connection := f.connect(t)
+	other := NewManager(NewClient("another-client"), ManagerOptions{Secrets: f.secrets, State: f.state})
+	if err := other.Disconnect(t.Context()); !errors.Is(err, ErrClientChanged) {
+		t.Fatalf("Disconnect with another client reported %v", err)
+	}
+	if err := other.Discard(t.Context(), connection.ID); !errors.Is(err, ErrClientChanged) {
+		t.Fatalf("Discard with another client reported %v", err)
+	}
+	if err := f.m.Discard(t.Context(), connection.ID); err != nil {
+		t.Fatal(err)
+	}
+	// With nothing left to clean up remotely, the old grant is forgotten
+	// locally without using the other client.
+	other = NewManager(NewClient("another-client"), ManagerOptions{Secrets: f.secrets, State: f.state})
+	_, _, _, revokes := f.control.counts()
+	if err := other.Disconnect(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, after := f.control.counts(); after != revokes || f.secrets.len() != 0 || other.State().Authorized {
+		t.Fatal("Disconnect did not forget the other client's grant locally")
+	}
+}
+
+func TestManagerRenewalBackoffIsPerConnection(t *testing.T) {
+	f := newManagerFixture(t)
+	f.authorize(t)
+	first, second := f.connect(t), f.connect(t)
+	for _, connection := range []Connection{first, second} {
+		var credentials Credentials
+		f.secrets.edit(t, connection.SecretKey(), &credentials, func() { credentials.ExpiresAt = time.Now().Add(3 * 24 * time.Hour) })
+	}
+	f.control.set(func(c *controlFixture) { c.refreshFails = true })
+	f.expireOAuth(t)
+	if _, err := f.m.Credentials(t.Context(), first); err != nil {
+		t.Fatal(err)
+	}
+	if f.m.renewRetryAt[first.ID].IsZero() || !f.m.renewRetryAt[second.ID].IsZero() {
+		t.Fatal("a failed renewal of one connection delayed the others")
+	}
+	f.control.set(func(c *controlFixture) { c.refreshFails = false })
+	renewed, err := f.m.Credentials(t.Context(), second)
+	if err != nil || renewed.TokenID == second.TokenID {
+		t.Fatal("another connection did not renew while the first backed off:", err)
 	}
 }

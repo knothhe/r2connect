@@ -90,10 +90,15 @@ type Client struct {
 	APIBaseURL   string
 	OAuthBaseURL string
 	Diagnostic   func(DiagnosticEvent)
+	// RequestTimeout bounds each Cloudflare request, on top of any
+	// HTTPClient.Timeout. Zero means 30 seconds.
+	RequestTimeout time.Duration
 }
 
+const defaultRequestTimeout = 30 * time.Second
+
 func NewClient(clientID string) *Client {
-	return &Client{ClientID: clientID, HTTPClient: &http.Client{Timeout: 30 * time.Second}, APIBaseURL: DefaultAPIBaseURL, OAuthBaseURL: DefaultOAuthBaseURL}
+	return &Client{ClientID: clientID, HTTPClient: &http.Client{Timeout: defaultRequestTimeout}, APIBaseURL: DefaultAPIBaseURL, OAuthBaseURL: DefaultOAuthBaseURL}
 }
 
 // NewPKCE generates independent CSRF state and an RFC 7636 verifier. The
@@ -569,7 +574,11 @@ func (c *Client) requestWithMetadata(ctx context.Context, operation, method stri
 		}
 		c.diagnose(DiagnosticEvent{Operation: operation, Phase: "request_completed", Method: method, HTTPStatus: metadata.status, ErrorCodes: codes, CFRay: metadata.ray, DurationMS: time.Since(started).Milliseconds(), Result: outcome})
 	}()
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	timeout := c.RequestTimeout
+	if timeout <= 0 {
+		timeout = defaultRequestTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, method, u.String(), bytes.NewReader(body))
 	if err != nil {
@@ -586,7 +595,7 @@ func (c *Client) requestWithMetadata(ctx context.Context, operation, method stri
 	for key, value := range headers {
 		req.Header.Set(key, value)
 	}
-	client := http.Client{Timeout: 30 * time.Second}
+	client := http.Client{Timeout: timeout}
 	if c.HTTPClient != nil {
 		client = *c.HTTPClient
 	}

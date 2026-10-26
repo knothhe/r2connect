@@ -26,6 +26,14 @@ var (
 	ErrCleanupPending = errors.New("Reconnect Cloudflare to remove the remaining R2 tokens.")
 )
 
+// ErrInvalidOptions reports ManagerOptions the Manager cannot run with. It is
+// a programming error: LoadError and every operation return it.
+var ErrInvalidOptions = errors.New("invalid r2connect ManagerOptions")
+
+// maxTokenNamePrefix leaves room for the 12-character connection identifier
+// within Cloudflare's 120-byte API token name.
+const maxTokenNamePrefix = 120 - 12
+
 // Warning reports cleanup that failed after the operation itself succeeded.
 // The Manager remembers what is left, and Disconnect retries it.
 type Warning int
@@ -54,9 +62,11 @@ type ManagerOptions struct {
 	Secrets SecretStore
 	State   StateStore
 	// TokenNamePrefix starts the name of each API token in the Cloudflare
-	// dashboard. Default "r2connect-".
+	// dashboard. Default "r2connect-"; at most 108 bytes.
 	TokenNamePrefix string
-	// CredentialLifetime is how long each API token lasts. Default 30 days.
+	// CredentialLifetime is how long each API token lasts. Default 30 days. It
+	// must exceed RenewalWindow, and ExpiryMargin by more than a minute, or
+	// fresh credentials would be renewed again on every use.
 	CredentialLifetime time.Duration
 	// RenewalWindow: with a refresh token, credentials are renewed silently once
 	// they expire within this window. Default 7 days.
@@ -94,12 +104,14 @@ type Manager struct {
 	pendingRetired []RetiredToken
 	// Disconnect revoked the grant but could not finish locally.
 	revoked bool
-	// Failed early renewals wait before retrying while credentials stay valid.
-	renewRetryAt time.Time
+	// Failed early renewals wait before retrying while credentials stay valid,
+	// per connection ID, so one failing bucket does not delay the others.
+	renewRetryAt map[string]time.Time
 }
 
-// NewManager loads saved State. A load failure is kept in LoadError and
-// returned by every operation; nothing is written over the original.
+// NewManager validates opts and loads saved State. Invalid options
+// (ErrInvalidOptions) or a load failure are kept in LoadError and returned by
+// every operation; nothing is written over the original State.
 func NewManager(client *Client, opts ManagerOptions) *Manager {
 	if opts.TokenNamePrefix == "" {
 		opts.TokenNamePrefix = "r2connect-"
@@ -119,14 +131,35 @@ func NewManager(client *Client, opts ManagerOptions) *Manager {
 	if opts.MaxConnections == 0 {
 		opts.MaxConnections = 16
 	}
-	m := &Manager{client: client, opts: opts}
-	m.state, m.loadErr = LoadState(opts.State)
+	m := &Manager{client: client, opts: opts, renewRetryAt: make(map[string]time.Time)}
+	if m.loadErr = validateOptions(opts); m.loadErr == nil {
+		m.state, m.loadErr = LoadState(opts.State)
+	}
 	if m.loadErr != nil {
-		m.state = State{Version: 1, Connections: []Connection{}}
+		m.state = emptyState()
 	}
 	return m
 }
 
+// validateOptions checks opts after defaults have been applied.
+func validateOptions(opts ManagerOptions) error {
+	invalid := func(detail string) error { return fmt.Errorf("%w: %s", ErrInvalidOptions, detail) }
+	switch {
+	case opts.Secrets == nil || opts.State == nil:
+		return invalid("Secrets and State are required")
+	case opts.CredentialLifetime < 0 || opts.RenewalWindow < 0 || opts.ExpiryMargin < 0 || opts.RenewalRetryDelay < 0 || opts.MaxConnections < 0:
+		return invalid("durations and MaxConnections must not be negative")
+	case opts.CredentialLifetime <= opts.RenewalWindow:
+		return invalid("CredentialLifetime must be longer than RenewalWindow")
+	case opts.CredentialLifetime <= opts.ExpiryMargin+time.Minute:
+		return invalid("CredentialLifetime must exceed ExpiryMargin by more than a minute")
+	case len(opts.TokenNamePrefix) > maxTokenNamePrefix:
+		return invalid("TokenNamePrefix must be at most 108 bytes")
+	}
+	return nil
+}
+
+// LoadError reports invalid ManagerOptions or saved State that cannot be used.
 func (m *Manager) LoadError() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -504,17 +537,17 @@ func (m *Manager) Credentials(ctx context.Context, want Connection) (Credentials
 		return Credentials{}, ErrCredentialsInvalid
 	}
 	remaining := time.Until(credentials.ExpiresAt)
-	if remaining > m.opts.ExpiryMargin && (!m.state.Renewable || remaining > m.opts.RenewalWindow || time.Now().Before(m.renewRetryAt)) {
+	if remaining > m.opts.ExpiryMargin && (!m.state.Renewable || remaining > m.opts.RenewalWindow || time.Now().Before(m.renewRetryAt[connection.ID])) {
 		return credentials, nil
 	}
 	renewed, err := m.renewCredentialsLocked(ctx, index, connection)
 	if err != nil && remaining > m.opts.ExpiryMargin {
 		// Early renewal is best effort; current credentials keep working.
-		m.renewRetryAt = time.Now().Add(m.opts.RenewalRetryDelay)
+		m.renewRetryAt[connection.ID] = time.Now().Add(m.opts.RenewalRetryDelay)
 		return credentials, nil
 	}
 	if err == nil {
-		m.renewRetryAt = time.Time{}
+		delete(m.renewRetryAt, connection.ID)
 	}
 	return renewed, err
 }
@@ -563,6 +596,9 @@ func (m *Manager) Discard(ctx context.Context, id string) error {
 	if index < 0 {
 		return nil
 	}
+	if err := m.checkClientLocked(); err != nil {
+		return err
+	}
 	tokens, err := m.tokensLocked(ctx)
 	if err != nil {
 		return err
@@ -576,20 +612,27 @@ func (m *Manager) Discard(ctx context.Context, id string) error {
 	}
 	next := m.state.clone()
 	next.Connections = append(next.Connections[:index], next.Connections[index+1:]...)
-	return m.saveLocked(next)
+	if err = m.saveLocked(next); err != nil {
+		return err
+	}
+	delete(m.renewRetryAt, id)
+	return nil
 }
 
 // Disconnect removes every connection's API token and saved credentials,
 // revokes the OAuth grant and forgets it. After a failure it can be retried:
 // remote deletions are idempotent, and a grant already revoked is not used
-// again.
+// again. When it cannot finish at all, Forget clears this device instead.
+//
+// A grant saved with another OAuth client is only forgotten locally, and only
+// when it has no connections or cleanup left; otherwise ErrClientChanged.
 func (m *Manager) Disconnect(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.loadErr != nil {
-		return m.loadErr
+	if err := m.checkClientLocked(); err != nil {
+		return err
 	}
-	if m.state.Authorized && !m.revoked {
+	if m.state.Authorized && m.state.ClientID == m.client.ClientID && !m.revoked {
 		tokens, err := m.tokensLocked(ctx)
 		if err != nil {
 			return err
@@ -643,5 +686,51 @@ func (m *Manager) Disconnect(ctx context.Context) error {
 	}
 	m.pendingTokens = nil
 	m.revoked = false
+	clear(m.renewRetryAt)
 	return nil
+}
+
+// Forget erases the saved authorization, every connection and all pending
+// cleanup from this device without contacting Cloudflare. It is the way out
+// when Disconnect cannot finish: the grant was revoked in the dashboard and
+// the user no longer has access to every connected account, or connections
+// were made with an OAuth client that is gone.
+//
+// Nothing is removed remotely. Forget returns the API tokens that may still
+// exist, so the application can ask the user to delete them in the Cloudflare
+// dashboard; the OAuth grant, if still valid, is not revoked either. Secrets
+// are deleted before State is cleared, so a failed Forget can be retried.
+func (m *Manager) Forget() ([]RetiredToken, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.loadErr != nil {
+		return nil, m.loadErr
+	}
+	orphans := []RetiredToken{}
+	var keys []string
+	for _, connection := range m.state.Connections {
+		orphans = appendRetiredToken(orphans, RetiredToken{AccountID: connection.AccountID, TokenID: connection.TokenID})
+		keys = append(keys, connection.SecretKey())
+	}
+	for _, retired := range append(append([]RetiredToken{}, m.state.RetiredTokens...), m.pendingRetired...) {
+		orphans = appendRetiredToken(orphans, RetiredToken{AccountID: retired.AccountID, TokenID: retired.TokenID})
+		if retired.CredentialKey != "" {
+			keys = append(keys, retired.CredentialKey)
+		}
+	}
+	keys = append(append(keys, m.state.RetiredOAuthKeys...), m.oauthKey())
+	for _, key := range keys {
+		if err := m.opts.Secrets.Delete(key); err != nil {
+			return nil, err
+		}
+	}
+	// Bypass saveLocked: it would carry pendingRetired into the empty State.
+	next := emptyState()
+	if err := m.opts.State.Save(next); err != nil {
+		return nil, err
+	}
+	m.state = next
+	m.pendingTokens, m.pendingRetired, m.revoked = nil, nil, false
+	clear(m.renewRetryAt)
+	return orphans, nil
 }

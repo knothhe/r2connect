@@ -116,6 +116,9 @@ func (nativeBackend) Load(service, key string) ([]byte, error) {
 }
 
 func (b nativeBackend) Save(service, key string, value []byte) error {
+	if len(value) == 0 {
+		return errors.New("invalid credential value")
+	}
 	serviceC, keyC, labelC := C.CString(service), C.CString(key), C.CString(b.label)
 	defer C.free(unsafe.Pointer(serviceC))
 	defer C.free(unsafe.Pointer(keyC))

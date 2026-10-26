@@ -11,8 +11,15 @@ import (
 )
 
 // ErrInvalidState reports saved Manager metadata that cannot be used. The
-// original is left in place so it can be recovered.
+// original is left in place so it can be recovered. Every validation failure
+// matches it with errors.Is.
 var ErrInvalidState = errors.New("invalid Cloudflare authorization metadata")
+
+// stateError keeps a specific message while matching ErrInvalidState.
+type stateError string
+
+func (e stateError) Error() string        { return string(e) }
+func (e stateError) Is(target error) bool { return target == ErrInvalidState }
 
 const maxStateBytes = 64 << 10
 
@@ -122,7 +129,16 @@ func (f FileStateStore) Save(state State) error {
 	if err != nil {
 		return err
 	}
-	return os.Rename(file.Name(), f.Path)
+	if err = os.Rename(file.Name(), f.Path); err != nil {
+		return err
+	}
+	// Persist the rename itself. Not every platform can sync a directory, so
+	// this is best effort.
+	if dir, err := os.Open(filepath.Dir(f.Path)); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	return nil
 }
 
 // LoadState reads and validates saved State. Without saved State it returns
@@ -133,7 +149,7 @@ func LoadState(store StateStore) (State, error) {
 		return State{}, err
 	}
 	if !ok {
-		return State{Version: 1, Connections: []Connection{}}, nil
+		return emptyState(), nil
 	}
 	if err = validateState(state); err != nil {
 		return State{}, err
@@ -148,21 +164,13 @@ func validSecretKey(key string) bool {
 	return key != "" && len(key) <= 128 && utf8.ValidString(key) && !strings.ContainsRune(key, '\x00')
 }
 
-func validTokenID(value string) bool {
-	if len(value) != 32 {
-		return false
-	}
-	for _, char := range value {
-		if (char < 'a' || char > 'f') && (char < '0' || char > '9') {
-			return false
-		}
-	}
-	return true
+func emptyState() State {
+	return State{Version: 1, Connections: []Connection{}}
 }
 
 func validateState(state State) error {
 	if state.Version != 1 {
-		return errors.New("unsupported Cloudflare authorization metadata")
+		return stateError("unsupported Cloudflare authorization metadata")
 	}
 	if state.Authorized && (state.ClientID == "" || len(state.ClientID) > 256 || strings.ContainsAny(state.ClientID, " \t\r\n")) {
 		return ErrInvalidState
@@ -172,26 +180,26 @@ func validateState(state State) error {
 	}
 	for _, key := range state.RetiredOAuthKeys {
 		if !validSecretKey(key) || !strings.HasPrefix(key, "oauth-") {
-			return errors.New("invalid Cloudflare authorization cleanup metadata")
+			return stateError("invalid Cloudflare authorization cleanup metadata")
 		}
 	}
 	seen := make(map[string]bool)
 	for _, connection := range state.Connections {
 		key := connection.SecretKey()
-		if len(connection.ID) < 12 || len(connection.ID) > 80 || strings.ContainsAny(connection.ID, " /\\\x00\r\n\t") || seen[connection.ID] || connection.Bucket == "" || connection.ExpiresAt.IsZero() || !validTokenID(connection.TokenID) || !validSecretKey(key) || !strings.HasPrefix(key, "connection-") {
-			return errors.New("invalid Cloudflare connection metadata")
+		if len(connection.ID) < 12 || len(connection.ID) > 80 || strings.ContainsAny(connection.ID, " /\\\x00\r\n\t") || seen[connection.ID] || connection.Bucket == "" || connection.ExpiresAt.IsZero() || !validID(connection.TokenID) || !validSecretKey(key) || !strings.HasPrefix(key, "connection-") {
+			return stateError("invalid Cloudflare connection metadata")
 		}
 		if _, err := Endpoint(connection.AccountID, connection.Jurisdiction); err != nil {
-			return errors.New("invalid Cloudflare connection metadata")
+			return stateError("invalid Cloudflare connection metadata")
 		}
 		seen[connection.ID] = true
 	}
 	for _, retired := range state.RetiredTokens {
-		if !validTokenID(retired.TokenID) || retired.CredentialKey != "" && (!validSecretKey(retired.CredentialKey) || !strings.HasPrefix(retired.CredentialKey, "connection-")) {
-			return errors.New("invalid Cloudflare credential cleanup metadata")
+		if !validID(retired.TokenID) || retired.CredentialKey != "" && (!validSecretKey(retired.CredentialKey) || !strings.HasPrefix(retired.CredentialKey, "connection-")) {
+			return stateError("invalid Cloudflare credential cleanup metadata")
 		}
 		if _, err := Endpoint(retired.AccountID, "default"); err != nil {
-			return errors.New("invalid Cloudflare credential cleanup metadata")
+			return stateError("invalid Cloudflare credential cleanup metadata")
 		}
 	}
 	return nil

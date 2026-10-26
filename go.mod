@@ -1,6 +1,6 @@
 module github.com/knothhe/r2connect
 
-go 1.26.8
+go 1.25.0
 
 require (
 	github.com/godbus/dbus/v5 v5.2.2

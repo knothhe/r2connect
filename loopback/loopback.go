@@ -212,19 +212,19 @@ func (f *Flow) Wait(ctx context.Context) (r2connect.TokenSet, error) {
 		stateMatches := len(q["state"]) == 1 && subtle.ConstantTimeCompare([]byte(q.Get("state")), []byte(f.state)) == 1
 		if req.Method != "GET" || req.Host != host || req.URL.Path != path {
 			f.diagnose(Event{Stage: "callback_rejected", Result: "invalid_request"})
-			http.Error(w, "Invalid callback.", 400)
+			http.Error(w, "Invalid callback.", http.StatusBadRequest)
 			return
 		}
 		if !stateMatches {
 			f.diagnose(Event{Stage: "callback_rejected", Result: "invalid_state"})
-			http.Error(w, "Invalid authorization state.", 400)
+			http.Error(w, "Invalid authorization state.", http.StatusBadRequest)
 			return
 		}
 		f.mu.Lock()
 		if f.consumed || ctx.Err() != nil {
 			f.mu.Unlock()
 			f.diagnose(Event{Stage: "callback_rejected", Result: "inactive"})
-			http.Error(w, "Sign-in is no longer active.", 409)
+			http.Error(w, "Sign-in is no longer active.", http.StatusConflict)
 			return
 		}
 		if q.Get("error") != "" {
@@ -245,7 +245,7 @@ func (f *Flow) Wait(ctx context.Context) (r2connect.TokenSet, error) {
 		if len(q["code"]) != 1 || q.Get("code") == "" || len(q.Get("code")) > 8192 {
 			f.mu.Unlock()
 			f.diagnose(Event{Stage: "callback_rejected", Result: "invalid_code"})
-			http.Error(w, "Missing authorization code.", 400)
+			http.Error(w, "Missing authorization code.", http.StatusBadRequest)
 			return
 		}
 		f.consumed = true
@@ -266,11 +266,11 @@ func (f *Flow) Wait(ctx context.Context) (r2connect.TokenSet, error) {
 			discard(f.client, tokens)
 			if ctx.Err() != nil {
 				finish(ctx.Err())
-				http.Error(w, f.opts.Messages.Canceled, 409)
+				http.Error(w, f.opts.Messages.Canceled, http.StatusConflict)
 				return
 			}
 			finish(err)
-			http.Error(w, f.opts.Messages.Failed, 400)
+			http.Error(w, f.opts.Messages.Failed, http.StatusBadRequest)
 			return
 		}
 		f.mu.Lock()

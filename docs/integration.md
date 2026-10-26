@@ -52,8 +52,10 @@ manager := r2connect.NewManager(client, r2connect.ManagerOptions{
 	OnWarning:       func(w r2connect.Warning) { /* see "Warnings" */ },
 })
 if err := manager.LoadError(); err != nil {
-	// The state file exists but cannot be used. It is left untouched; offer
-	// manual configuration and do not delete it automatically.
+	// errors.Is(err, r2connect.ErrInvalidOptions): fix the ManagerOptions.
+	// errors.Is(err, r2connect.ErrInvalidState): the state file exists but
+	// cannot be used. It is left untouched; offer manual configuration and do
+	// not delete it automatically.
 }
 ```
 
@@ -64,6 +66,13 @@ if err := manager.LoadError(); err != nil {
 - The defaults are 30-day credentials, silent renewal within 7 days of expiry,
   a 5-minute hard margin and a 1-hour back-off after a failed early renewal.
   Override them in `ManagerOptions` only if you have a reason to.
+  `NewManager` rejects inconsistent values with `ErrInvalidOptions`:
+  `CredentialLifetime` must be longer than `RenewalWindow` and exceed
+  `ExpiryMargin` by more than a minute, or fresh credentials would be renewed
+  on every use. Shortening the lifetime therefore means shortening the window
+  too. `TokenNamePrefix` is limited to 108 bytes.
+- Each Cloudflare request times out after 30 seconds; set
+  `client.RequestTimeout` to change it.
 - `OnWarning` runs while the Manager is locked. Do not call the Manager from
   it, and do not hold a lock of yours that a Manager call might also need.
 
@@ -219,6 +228,19 @@ deletions are idempotent, and a grant already revoked is not used again.
 `ErrCleanupPending` means the grant is revoked but some tokens remain; a new
 sign-in lets `Disconnect` finish. Clear your saved profile after it succeeds.
 
+When `Disconnect` cannot finish at all, for example because the user revoked
+the grant in the Cloudflare dashboard and no longer has access to a connected
+account, offer `Forget` as an explicit "remove from this device" action:
+
+```go
+leftover, err := manager.Forget()
+```
+
+It deletes every saved secret and clears the state without contacting
+Cloudflare. `leftover` lists the API tokens (account and token ID) that may
+still exist; tell the user to delete them in the dashboard. The OAuth grant is
+not revoked either.
+
 ## Errors and warnings
 
 Manager errors are sentinels with user-ready English messages, so you can show
@@ -231,12 +253,14 @@ Manager errors are sentinels with user-ready English messages, so you can show
 | `ErrAuthorizationExpired` | Code-only grant expired; connect again. |
 | `ErrMissingScopes` | The grant lacks a required scope. |
 | `ErrAccountsMissing` | A new grant omits an account that still has connections. |
-| `ErrClientChanged` | Connections from another Client ID remain. |
+| `ErrClientChanged` | Connections from another Client ID remain; restore it to disconnect them, or `Forget`. |
 | `ErrBucketUnavailable` | The bucket is not in that account and jurisdiction. |
 | `ErrTooManyConnections` | More than `MaxConnections` pending; disconnect to clean up. |
 | `ErrUnknownConnection` | No saved connection matches. |
 | `ErrCredentialsInvalid` | Saved credentials are unreadable; reconnect the bucket. |
 | `ErrCleanupPending` | See Disconnect. |
+| `ErrInvalidOptions` | `ManagerOptions` are inconsistent; a programming error. |
+| `ErrInvalidState` | The saved state file cannot be used; it is left untouched. |
 | `*r2connect.APIError` | A Cloudflare API failure; its message is sanitized. |
 
 Warnings report cleanup that failed after the operation itself succeeded. The

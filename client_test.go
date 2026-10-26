@@ -425,6 +425,17 @@ func TestCancellationAndOversizedResponse(t *testing.T) {
 			t.Fatalf("context cancellation lost: %v", err)
 		}
 	})
+	t.Run("request timeout", func(t *testing.T) {
+		client := testClient(t, func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() })
+		client.RequestTimeout = 20 * time.Millisecond
+		started := time.Now()
+		if _, err := client.Accounts(context.Background(), "access"); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("RequestTimeout was not applied: %v", err)
+		}
+		if elapsed := time.Since(started); elapsed > 5*time.Second {
+			t.Fatalf("request ran for %v despite a 20ms RequestTimeout", elapsed)
+		}
+	})
 	t.Run("size", func(t *testing.T) {
 		client := testClient(t, func(w http.ResponseWriter, r *http.Request) {
 			_, _ = io.WriteString(w, strings.Repeat("x", maxResponseBytes+1))

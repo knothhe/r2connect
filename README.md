@@ -83,6 +83,8 @@ unticked by default, and sign-in fails without it.
 - `keyring.Store` stops touching the credential store after the user refuses
   its prompt, until `RetryAccess` is called for an explicit user action.
 - Unreadable saved state is reported by `LoadError` and never overwritten.
+- When `Disconnect` cannot reach a usable grant, `Forget` clears this device
+  and lists the API tokens left for the user to delete in the dashboard.
 
 ## Testing
 
@@ -92,3 +94,7 @@ go test -race ./...
 
 `R2CONNECT_TEST_SECRET_SERVICE=1` also runs a round trip against the real
 Linux session keyring.
+
+## License
+
+[MIT](LICENSE)
