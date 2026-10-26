@@ -15,47 +15,61 @@ r2connect/keyring    SecretStore on the macOS Keychain, Windows Credential Manag
                      or a Linux Secret Service keyring
 ```
 
-## Usage
+## Documentation
 
-Register a Cloudflare OAuth client that allows the Refresh Token grant, the
-scopes in `r2connect.OAuthScopes`, and a loopback redirect URI such as
-`http://localhost:18796/oauth/cloudflare/callback`.
+- [Integrate r2connect](docs/integration.md): sign-in, bucket selection, using
+  and renewing credentials, disconnecting, errors, platforms and testing.
+- [Configure the Cloudflare OAuth client](docs/cloudflare-oauth-client.md):
+  the one-time registration in your Cloudflare account, through the dashboard
+  or the API.
+- [API reference](https://pkg.go.dev/github.com/knothhe/r2connect)
 
-```go
-client := r2connect.NewClient(clientID)
-manager := r2connect.NewManager(client, r2connect.ManagerOptions{
-	Secrets:         keyring.New("com.example.app.r2", "Example credentials"),
-	State:           r2connect.FileStateStore{Path: filepath.Join(dataDir, "r2-oauth-state.json")},
-	TokenNamePrefix: "example-",
-})
+## Quick start
 
-// Sign in: the grant is saved before the browser page reports success.
-_, err := loopback.Authorize(ctx, client, loopback.Options{
-	RedirectURI: "http://localhost:18796/oauth/cloudflare/callback",
-	Accept:      manager.Authorize,
-}, openBrowser)
+1. Register an OAuth client. Or hand this prompt to a coding agent that can run
+   commands or use your browser:
 
-// Choose a bucket and provision credentials for it.
-accounts, err := manager.Accounts(ctx)
-buckets, err := manager.Buckets(ctx, accounts[0].ID, "default")
-conn, err := manager.Connect(ctx, accounts[0].ID, buckets[0].Name, "default")
+   > Follow https://github.com/knothhe/r2connect/blob/main/docs/cloudflare-oauth-client.md to register a private Cloudflare OAuth client named `<app name>` with redirect URL `<http://localhost:port/path>`, then tell me its Client ID.
 
-// Before each use: renewed automatically near expiry.
-creds, err := manager.Credentials(ctx, conn)
-endpoint, err := r2connect.Endpoint(conn.AccountID, conn.Jurisdiction)
-// S3 client: endpoint, region "auto", path-style, creds.AccessKeyID / creds.SecretAccessKey.
+2. Install the module:
 
-// Remove every token, revoke the grant and forget it.
-err = manager.Disconnect(ctx)
-```
+   ```sh
+   go get github.com/knothhe/r2connect@latest
+   ```
 
-Persist `conn.ID`, `AccountID`, `Bucket` and `Jurisdiction` with your own
-configuration; `Credentials` only returns credentials for an exact match.
+3. Wire it up:
 
-For a sign-in the user can cancel, use `loopback.Start`, open `Flow.URL()`, and
-call `Flow.Wait` with a cancelable context. `Options.Done` receives the result
-before the browser page is written, so status shown in the application is
-already current when the user returns.
+   ```go
+   client := r2connect.NewClient(clientID)
+   manager := r2connect.NewManager(client, r2connect.ManagerOptions{
+       Secrets:         keyring.New("com.example.app.r2", "Example credentials"),
+       State:           r2connect.FileStateStore{Path: filepath.Join(dataDir, "r2-oauth-state.json")},
+       TokenNamePrefix: "example-",
+   })
+
+   // Sign in: the grant is saved before the browser page reports success.
+   _, err := loopback.Authorize(ctx, client, loopback.Options{
+       RedirectURI: "http://localhost:18796/oauth/cloudflare/callback",
+       Accept:      manager.Authorize,
+   }, openBrowser)
+
+   // Choose a bucket and provision credentials for it.
+   accounts, err := manager.Accounts(ctx)
+   buckets, err := manager.Buckets(ctx, accounts[0].ID, "default")
+   conn, err := manager.Connect(ctx, accounts[0].ID, buckets[0].Name, "default")
+
+   // Before each use: renewed automatically near expiry.
+   creds, err := manager.Credentials(ctx, conn)
+   endpoint, err := r2connect.Endpoint(conn.AccountID, conn.Jurisdiction)
+   // S3 client: endpoint, region "auto", path-style, creds.AccessKeyID / creds.SecretAccessKey.
+
+   // Remove every token, revoke the grant and forget it.
+   err = manager.Disconnect(ctx)
+   ```
+
+Tell users before they authorize: on Cloudflare's consent page, click **Edit
+Permissions** and turn on **Account API Tokens Write**. Cloudflare leaves it
+unticked by default, and sign-in fails without it.
 
 ## Failure handling
 
