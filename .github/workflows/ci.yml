@@ -1,9 +1,9 @@
 name: CI
 
+# Runs only for release tags, such as v0.1.1.
 on:
   push:
-    branches: [main]
-  pull_request:
+    tags: ['v*']
 
 permissions:
   contents: read
